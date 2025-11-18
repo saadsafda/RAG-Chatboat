@@ -1,0 +1,9 @@
+Destro Services
+
+Destro provides managed cloud and infrastructure services, specializing in secure deployments and rapid scale. Key offerings include:
+- Cloud architecture design
+- Managed Kubernetes and container orchestration
+- DevOps automation and CI/CD pipelines
+- 24/7 monitoring and incident response
+
+Contact sales at sales@destro.example for more information.
