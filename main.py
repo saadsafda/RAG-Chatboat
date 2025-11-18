@@ -336,15 +336,27 @@ from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 import requests
 from typing import Optional, List
+import logging
+import time
 
 try:
     from openai import OpenAI
+    # Try importing common exception classes (available in openai>=1.x)
+    try:
+        from openai import APIError, AuthenticationError, RateLimitError, OpenAIError
+    except Exception:
+        APIError = AuthenticationError = RateLimitError = OpenAIError = Exception
 except Exception:
     OpenAI = None
+    APIError = AuthenticationError = RateLimitError = OpenAIError = Exception
 
 # --- Configuration ---
 app = FastAPI()
 load_dotenv()
+
+# Basic logging setup
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("rag-app")
 
 # --- Data Models ---
 class ChatMetadata(BaseModel):
@@ -364,8 +376,13 @@ class ChatRequest(BaseModel):
 def fetch_and_save_url(url: str) -> str:
     # ... [Keep your existing fetch_and_save_url code here] ...
     # (For brevity, assume your existing scraper code is here)
+    # Basic URL validation
+    parsed = urlparse(url or "")
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise RuntimeError("Invalid URL. Only http/https are allowed.")
+
     try:
-        resp = requests.get(url, timeout=15)
+        resp = requests.get(url, timeout=20)
         resp.raise_for_status()
     except Exception as e:
         raise RuntimeError(f"Failed to fetch {url}: {e}")
@@ -390,7 +407,6 @@ def fetch_and_save_url(url: str) -> str:
     KNOW_DIR = Path("knowledge")
     KNOW_DIR.mkdir(parents=True, exist_ok=True)
     
-    parsed = urlparse(url)
     safe_path = re.sub(r"[^0-9A-Za-z_-]", "_", parsed.netloc + parsed.path) or "page"
     filename = f"{safe_path}.txt"
     (KNOW_DIR / filename).write_text(f"URL: {url}\n\n{body_text}", encoding="utf-8")
@@ -403,8 +419,12 @@ def generate_ai_response(message: str, user_name: str):
     TOP_K = 3
     OPENAI_KEY = os.getenv("OPENAI_API_KEY")
     
+    if not message or not message.strip():
+        return "Please provide a question."
+
     if not OPENAI_KEY or OpenAI is None:
-        return "OpenAI API Key missing."
+        logger.warning("OpenAI not configured or missing key; returning fallback reply.")
+        return "I'm currently unable to use the AI model. Please try again later."
 
     client = OpenAI(api_key=OPENAI_KEY)
 
@@ -416,8 +436,27 @@ def generate_ai_response(message: str, user_name: str):
         "Be polite, professional, and concise."
     )
 
+    def _retry_sleep(attempt: int):
+        # Exponential backoff with jitter
+        delay = min(2 ** attempt, 8) + (0.05 * attempt)
+        time.sleep(delay)
+
     def embed_text(text: str):
-        return client.embeddings.create(input=text, model="text-embedding-3-small").data[0].embedding
+        last_err = None
+        for attempt in range(3):
+            try:
+                return client.embeddings.create(input=text, model="text-embedding-3-small").data[0].embedding
+            except (RateLimitError, APIError) as e:
+                last_err = e
+                logger.warning(f"Embedding attempt {attempt+1} failed: {e}")
+                _retry_sleep(attempt)
+            except (AuthenticationError,) as e:
+                logger.error("Authentication with OpenAI failed (check OPENAI_API_KEY).")
+                raise
+            except Exception as e:
+                last_err = e
+                break
+        raise RuntimeError(f"Embedding request failed: {last_err}")
 
     def cosine_sim(a, b):
         dot = sum(x * y for x, y in zip(a, b))
@@ -450,17 +489,32 @@ def generate_ai_response(message: str, user_name: str):
 
     context_text = "\n---\n".join([d['text'] for d in top_docs])
     
-    try:
-        completion = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Context:\n{context_text}\n\nQuestion: {message}"}
-            ]
-        )
-        return completion.choices[0].message.content
-    except Exception as e:
-        return f"Error: {e}"
+    # Chat completion with small retry and graceful fallback
+    last_err = None
+    for attempt in range(3):
+        try:
+            completion = client.chat.completions.create(
+                model=os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"),
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": f"Context:\n{context_text}\n\nQuestion: {message}"}
+                ],
+                max_tokens=512,
+                temperature=0.2,
+            )
+            return completion.choices[0].message.content
+        except (RateLimitError, APIError) as e:
+            last_err = e
+            logger.warning(f"Chat attempt {attempt+1} failed: {e}")
+            _retry_sleep(attempt)
+        except (AuthenticationError,) as e:
+            logger.error("Authentication with OpenAI failed (check OPENAI_API_KEY).")
+            return "I'm having trouble authenticating with the AI service. Please try again later."
+        except Exception as e:
+            last_err = e
+            break
+    logger.error(f"Chat failed after retries: {last_err}")
+    return "I'm sorry, I'm having trouble generating a response right now. Please try again shortly."
 
 # --- API Endpoints ---
 @app.post("/chat")
@@ -472,7 +526,13 @@ async def chat_endpoint(request: ChatRequest):
 
 @app.post("/ingest")
 async def ingest_url_endpoint(payload: dict, background_tasks: BackgroundTasks):
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "Invalid JSON body")
     url = payload.get("url")
-    if not url: raise HTTPException(400, "Missing url")
+    if not url:
+        raise HTTPException(400, "Missing url")
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise HTTPException(400, "Invalid URL. Only http/https are allowed.")
     background_tasks.add_task(fetch_and_save_url, url)
     return {"status": "ingest_started"}
