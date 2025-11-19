@@ -358,6 +358,10 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("rag-app")
 
+# Domain-specific internal error to signal 500-worthy failures
+class InternalAIError(Exception):
+    pass
+
 # --- Data Models ---
 class ChatMetadata(BaseModel):
     name: Optional[str] = ""
@@ -420,11 +424,12 @@ def generate_ai_response(message: str, user_name: str):
     OPENAI_KEY = os.getenv("OPENAI_API_KEY")
     
     if not message or not message.strip():
-        return "Please provide a question."
+        # Bad request: no question provided
+        raise HTTPException(status_code=400, detail="Please provide a question.")
 
     if not OPENAI_KEY or OpenAI is None:
-        logger.warning("OpenAI not configured or missing key; returning fallback reply.")
-        return "I'm currently unable to use the AI model. Please try again later."
+        logger.warning("OpenAI not configured or missing key; raising InternalAIError.")
+        raise InternalAIError("AI service is unavailable. Please try again later.")
 
     client = OpenAI(api_key=OPENAI_KEY)
 
@@ -452,7 +457,8 @@ def generate_ai_response(message: str, user_name: str):
                 _retry_sleep(attempt)
             except (AuthenticationError,) as e:
                 logger.error("Authentication with OpenAI failed (check OPENAI_API_KEY).")
-                raise
+                # send proper error
+                raise InternalAIError("I'm having trouble authenticating with the AI service. Please try again later.")
             except Exception as e:
                 last_err = e
                 break
@@ -514,15 +520,28 @@ def generate_ai_response(message: str, user_name: str):
             last_err = e
             break
     logger.error(f"Chat failed after retries: {last_err}")
-    return "I'm sorry, I'm having trouble generating a response right now. Please try again shortly."
+    raise InternalAIError("I'm sorry, I'm having trouble generating a response right now. Please try again shortly.")
 
 # --- API Endpoints ---
 @app.post("/chat")
 async def chat_endpoint(request: ChatRequest):
     # Pure RAG response. No side effects.
     user_name = (request.metadata.name if request.metadata and request.metadata.name else "User")
-    ai_reply = generate_ai_response(request.message, user_name)
-    return {"reply": ai_reply}
+    try:
+        ai_reply = generate_ai_response(request.message, user_name)
+
+        return {"reply": ai_reply}
+    except InternalAIError as e:
+        # Convert internal AI failures to HTTP 500 for clients that expect error signaling
+        logger.warning(f"InternalAIError: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    except HTTPException:
+        # Re-raise explicit HTTPExceptions (e.g., 400 for bad input)
+        raise
+    except Exception as e:
+        # Unexpected errors -> 500
+        logger.exception("Unhandled error in /chat", e)
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.post("/ingest")
 async def ingest_url_endpoint(payload: dict, background_tasks: BackgroundTasks):
@@ -536,3 +555,43 @@ async def ingest_url_endpoint(payload: dict, background_tasks: BackgroundTasks):
         raise HTTPException(400, "Invalid URL. Only http/https are allowed.")
     background_tasks.add_task(fetch_and_save_url, url)
     return {"status": "ingest_started"}
+
+
+@app.get("/health")
+async def health(deep: bool = False):
+    """Basic health check.
+
+    Parameters:
+      - deep: if true, perform a lightweight OpenAI capability check (instantiate client).
+        Avoids expensive calls (no embedding/chat). Returns degraded status if fails.
+    """
+    openai_key = os.getenv("OPENAI_API_KEY")
+    openai_state = "missing"
+    if openai_key and OpenAI is not None:
+        try:
+            # Instantiate client (cheap). If deep, optionally hit models list (still light).
+            client = OpenAI(api_key=openai_key)
+            if deep:
+                # Light call: list one model (wrapped in try to avoid raising to caller)
+                try:
+                    _ = client.models.list().data[:1]
+                except Exception as e:
+                    logger.warning(f"Deep OpenAI check failed: {e}")
+                    openai_state = "error"
+                    return {"status": "degraded", "openai": openai_state, "knowledge_files": 0}
+            openai_state = "ready"
+        except Exception as e:
+            logger.warning(f"OpenAI client init failed: {e}")
+            openai_state = "error"
+    # Count knowledge files
+    knowledge_dir = Path("knowledge")
+    if knowledge_dir.exists():
+        k_files = sum(1 for _ in knowledge_dir.glob("**/*.txt"))
+    else:
+        k_files = 0
+    status = "ok" if openai_state in {"ready", "missing"} else "degraded"
+    return {
+        "status": status,
+        "openai": openai_state,
+        "knowledge_files": k_files
+    }
